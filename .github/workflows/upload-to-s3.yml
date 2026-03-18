@@ -1,0 +1,65 @@
+name: Upload Files from Google Drive to AWS S3
+
+# This workflow runs manually (workflow_dispatch)
+on:
+  workflow_dispatch:
+    inputs:
+      google_drive_folder_id:
+        description: 'Google Drive Folder ID (from the folder URL)'
+        required: true
+      s3_bucket:
+        description: 'S3 bucket name (leave empty to use secret)'
+        required: false
+        default: ''
+      s3_prefix:
+        description: 'S3 prefix/folder (optional)'
+        required: false
+        default: 'KCSB-Data'
+
+jobs:
+  transfer-files:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      
+      - name: Download from Google Drive and Upload to S3
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ github.event.inputs.google_drive_folder_id }}
+          S3_BUCKET_NAME: ${{ github.event.inputs.s3_bucket || secrets.S3_BUCKET_NAME }}
+          S3_PREFIX: ${{ github.event.inputs.s3_prefix }}
+          TEMP_DIRECTORY: './temp_downloads'
+        run: |
+          python upload_to_s3.py
+      
+      - name: Cleanup temporary files
+        if: always()
+        run: |
+          rm -rf ./temp_downloads
+      
+      - name: Transfer complete
+        run: |
+          echo "✅ Files successfully transferred from Google Drive to S3!"
+          echo "Google Drive Folder: ${{ github.event.inputs.google_drive_folder_id }}"
+          echo "S3 Bucket: ${{ github.event.inputs.s3_bucket || secrets.S3_BUCKET_NAME }}"
+          echo "S3 Folder: ${{ github.event.inputs.s3_prefix }}"
+
