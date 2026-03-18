@@ -7,6 +7,7 @@ from pathlib import Path
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 import io
 from datetime import datetime
 import time
@@ -23,6 +24,48 @@ def format_size(bytes):
             return f"{bytes:.2f} {unit}"
         bytes /= 1024.0
     return f"{bytes:.2f} TB"
+
+def retry_on_error(func, max_retries=5, initial_delay=1):
+    """
+    Retry a function with exponential backoff on errors.
+    """
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except HttpError as e:
+            if e.resp.status in [500, 502, 503, 504, 429]:
+                # Server error or rate limit - retry with exponential backoff
+                delay = initial_delay * (2 ** attempt)
+                if attempt < max_retries - 1:
+                    log_step(f"      ⚠️  Google API error (attempt {attempt + 1}/{max_retries}): {e.resp.status} - Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    log_step(f"      ❌ Google API error after {max_retries} attempts: {str(e)}")
+                    raise
+            else:
+                # Non-retryable error
+                log_step(f"      ❌ Google API error: {str(e)}")
+                raise
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            # Retry on throttling and server errors
+            if error_code in ['SlowDown', 'ServiceUnavailable', 'RequestTimeout'] or e.response.get('ResponseMetadata', {}).get('HTTPStatusCode', 0) >= 500:
+                delay = initial_delay * (2 ** attempt)
+                if attempt < max_retries - 1:
+                    log_step(f"      ⚠️  AWS error (attempt {attempt + 1}/{max_retries}): {error_code} - Retrying in {delay}s...")
+                    time.sleep(delay)
+                else:
+                    log_step(f"      ❌ AWS error after {max_retries} attempts: {str(e)}")
+                    raise
+            else:
+                # Non-retryable AWS error
+                log_step(f"      ❌ AWS error: {str(e)}")
+                raise
+        except Exception as e:
+            log_step(f"      ❌ Unexpected error: {str(e)}")
+            raise
+    
+    return None
 
 def get_google_drive_service():
     """
@@ -68,34 +111,47 @@ def download_file_from_drive(service, file_id, file_name, local_path, file_num, 
     try:
         log_step(f"   📥 [{file_num}/{total_files}] Downloading: {file_name}")
         
-        request = service.files().get_media(fileId=file_id)
+        # Use retry logic for download
+        def download():
+            request = service.files().get_media(fileId=file_id)
+            fh = io.BytesIO()
+            downloader = MediaIoBaseDownload(fh, request)
+            
+            done = False
+            last_progress = 0
+            while not done:
+                status, done = downloader.next_chunk()
+                if status:
+                    progress = int(status.progress() * 100)
+                    # Only print every 20% to reduce log spam
+                    if progress >= last_progress + 20 or done:
+                        print(f"      Progress: {progress}%")
+                        last_progress = progress
+            
+            return fh.getvalue()
+        
+        file_content = retry_on_error(download)
+        
+        if file_content is None:
+            log_step(f"      ✗ Failed to download: {file_name}")
+            return None
+        
+        # Write to file
         file_path = Path(local_path) / file_name
         file_path.parent.mkdir(parents=True, exist_ok=True)
         
-        fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        
-        done = False
-        last_progress = 0
-        while not done:
-            status, done = downloader.next_chunk()
-            if status:
-                progress = int(status.progress() * 100)
-                # Only print every 10% to reduce log spam
-                if progress >= last_progress + 10 or done:
-                    print(f"      Progress: {progress}%")
-                    last_progress = progress
-        
-        # Write to file
         with open(file_path, 'wb') as f:
-            f.write(fh.getvalue())
+            f.write(file_content)
         
-        file_size = len(fh.getvalue())
+        file_size = len(file_content)
         log_step(f"      ✓ Downloaded: {file_name} ({format_size(file_size)})")
         return file_path
         
+    except HttpError as e:
+        log_step(f"      ✗ Google Drive API error downloading {file_name}: {str(e)}")
+        return None
     except Exception as e:
-        print(f"  ✗ Error downloading {file_name}: {e}")
+        log_step(f"      ✗ Error downloading {file_name}: {str(e)}")
         return None
 
 def list_files_in_folder(service, folder_id, path='', depth=0):
@@ -112,12 +168,16 @@ def list_files_in_folder(service, folder_id, path='', depth=0):
         else:
             log_step(f"{indent}📁 Scanning subfolder: {path}")
         
-        query = f"'{folder_id}' in parents and trashed=false"
-        results = service.files().list(
-            q=query,
-            fields="files(id, name, mimeType)",
-            pageSize=1000
-        ).execute()
+        # Use retry logic for API call
+        def fetch_files():
+            query = f"'{folder_id}' in parents and trashed=false"
+            return service.files().list(
+                q=query,
+                fields="files(id, name, mimeType, size)",
+                pageSize=1000
+            ).execute()
+        
+        results = retry_on_error(fetch_files)
         
         items = results.get('files', [])
         log_step(f"{indent}   Found {len(items)} item(s) in this folder")
@@ -133,6 +193,9 @@ def list_files_in_folder(service, folder_id, path='', depth=0):
             
             if mime_type == 'application/vnd.google-apps.folder':
                 folder_count += 1
+                # Add small delay between folder scans to avoid rate limiting
+                if folder_count > 1:
+                    time.sleep(0.5)
                 # Recursively process subfolder
                 files_list.extend(list_files_in_folder(service, file_id, current_path, depth + 1))
             else:
@@ -148,8 +211,12 @@ def list_files_in_folder(service, folder_id, path='', depth=0):
         
         return files_list
         
+    except HttpError as e:
+        log_step(f"{indent}❌ Google Drive API error for folder {folder_id}: {str(e)}")
+        log_step(f"{indent}   This might be a temporary Google server issue. Try again in a few minutes.")
+        return []
     except Exception as e:
-        print(f"Error listing files in folder {folder_id}: {e}")
+        log_step(f"{indent}❌ Error listing files in folder {folder_id}: {str(e)}")
         return []
 
 def download_from_google_drive(folder_id, local_directory):
@@ -167,6 +234,11 @@ def download_from_google_drive(folder_id, local_directory):
     
     if not files_list:
         log_step("❌ No files found in the specified Google Drive folder")
+        log_step("   Possible reasons:")
+        log_step("   - Wrong folder ID")
+        log_step("   - Folder not shared with service account")
+        log_step("   - Only Google Docs/Sheets in folder (these are skipped)")
+        log_step("   - Temporary Google Drive API error (try again)")
         sys.exit(1)
     
     log_step(f"✓ Found {len(files_list)} file(s) to download")
@@ -183,6 +255,10 @@ def download_from_google_drive(folder_id, local_directory):
             downloaded_files.append(result)
         else:
             failed_files.append(file_name)
+        
+        # Add small delay between downloads to avoid rate limiting
+        if idx < len(files_list):
+            time.sleep(0.3)
     
     elapsed = time.time() - start_time
     log_step("")
@@ -192,6 +268,12 @@ def download_from_google_drive(folder_id, local_directory):
         log_step(f"   Failed: {len(failed_files)} file(s)")
         for fname in failed_files:
             log_step(f"      - {fname}")
+        log_step("")
+        log_step("   ⚠️  Some files failed - but continuing with successful downloads...")
+    
+    if not downloaded_files:
+        log_step("❌ No files were successfully downloaded")
+        sys.exit(1)
     
     return downloaded_files
 
@@ -237,10 +319,18 @@ def upload_files_to_s3(local_directory, bucket_name, s3_prefix=''):
             log_step(f"   📤 [{idx}/{len(files_to_upload)}] Uploading: {relative_path}")
             log_step(f"      Size: {format_size(file_size)}, Target: s3://{bucket_name}/{s3_key}")
             
-            s3_client.upload_file(str(file_path), bucket_name, s3_key)
+            # Retry S3 uploads with exponential backoff
+            def upload():
+                s3_client.upload_file(str(file_path), bucket_name, s3_key)
+            
+            retry_on_error(upload, max_retries=3, initial_delay=2)
             uploaded_count += 1
             total_size += file_size
             log_step(f"      ✓ Upload successful")
+            
+            # Small delay to avoid throttling
+            if idx < len(files_to_upload):
+                time.sleep(0.2)
             
         except ClientError as e:
             log_step(f"      ✗ Error uploading {file_path}: {e}")
